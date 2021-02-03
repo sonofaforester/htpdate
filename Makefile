@@ -4,6 +4,7 @@ mandir = ${prefix}/share/man
 
 CC = gcc
 CFLAGS += -Wall -std=c99 -pedantic -O2
+LIBS = -lssl -lcrypto
 
 INSTALL = /usr/bin/install -c
 STRIP = /usr/bin/strip -s
@@ -11,7 +12,7 @@ STRIP = /usr/bin/strip -s
 all: htpdate
 
 htpdate: htpdate.c
-	$(CC) $(CFLAGS) $(LDFLAGS) $(CPPFLAGS) -o htpdate htpdate.c
+	$(CC) $(CFLAGS) $(LDFLAGS) $(CPPFLAGS) -o htpdate htpdate.c $(LIBS)
 
 install: all
 	$(STRIP) htpdate

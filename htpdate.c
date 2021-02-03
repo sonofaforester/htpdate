@@ -51,6 +51,8 @@
 #include <limits.h>
 #include <pwd.h>
 #include <grp.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define VERSION 				"1.2.2"
 #define	MAX_HTTP_HOSTS			15				/* 16 web servers */
@@ -183,6 +185,71 @@ static void swgid( int id ) {
 	}
 }
 
+static int writeSSL( SSL *ssl, char *buf ) {
+	int rc, eno = 0;
+
+	while (1) {
+		rc = SSL_write( ssl, buf, strlen(buf) );
+		eno = SSL_get_error( ssl, rc );
+		switch ( eno ) {
+			case SSL_ERROR_NONE:
+				break;
+			case SSL_ERROR_WANT_READ:
+			case SSL_ERROR_WANT_WRITE:
+			case SSL_ERROR_SYSCALL:
+				continue;
+			default:
+				return -1;
+		}
+		return 0;
+	}
+}
+
+
+static int readSSL( SSL *ssl, char *buf ) {
+	int rc, eno = 0;
+
+	while (1) {
+		rc = SSL_read( ssl, buf, BUFFERSIZE );
+		eno = SSL_get_error( ssl, rc );
+		switch ( eno ) {
+			case SSL_ERROR_NONE:
+				break;
+			case SSL_ERROR_WANT_READ:
+			case SSL_ERROR_WANT_WRITE:
+			case SSL_ERROR_SYSCALL:
+				continue;
+			default:
+				return -1;
+		}
+		return 0;
+	}
+}
+
+
+static void closeSSL( SSL_CTX *ctx, SSL *ssl ) {
+	if ( ssl != NULL ) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+	}
+	if ( ctx != NULL ) {
+		SSL_CTX_free(ctx);
+	}
+	ERR_free_strings();
+}
+
+static int internalCertificateVerificationCallback(int preverify_ok, X509_STORE_CTX* ctx)
+{
+	int     err;
+
+    if(preverify_ok == 0) {
+		err = X509_STORE_CTX_get_error(ctx);
+    	printlog(1, "Certificate error: %s", X509_verify_cert_error_string(err));
+		return 0;
+	}
+
+	return preverify_ok;
+}
 
 static long getHTTPdate( char *host, char *port, char *proxy, char *proxyport, char *httpversion, int ipversion, int when ) {
 	int					server_s;
@@ -197,7 +264,17 @@ static long getHTTPdate( char *host, char *port, char *proxy, char *proxyport, c
 	char				remote_time[25] = { '\0' };
 	char				url[URLSIZE] = { '\0' };
 	char				*pdate = NULL;
+	unsigned int		is_ssl = 0;
+	SSL					*ssl = NULL;
+	SSL_CTX				*ctx = NULL;
+	char				*scheme;
+	int					ssl_eno;
+	X509_STORE 			*store;
 
+ 
+	if ( strcmp(port, "443") == 0 ) {
+		is_ssl = 1;
+	}
 
 	/* Connect to web server via proxy server or directly */
 	memset( &hints, 0, sizeof(hints) );
@@ -217,7 +294,8 @@ static long getHTTPdate( char *host, char *port, char *proxy, char *proxyport, c
 	if ( proxy == NULL ) {
 		rc = getaddrinfo( host, port, &hints, &res0 );
 	} else {
-		snprintf( url, URLSIZE, "http://%s:%s", host, port);
+		scheme = is_ssl ? "https" : "http";
+		snprintf( url, URLSIZE, "%s://%s:%s", scheme, host, port);
 		rc = getaddrinfo( proxy, proxyport, &hints, &res0 );
 	}
 
@@ -260,6 +338,31 @@ static long getHTTPdate( char *host, char *port, char *proxy, char *proxyport, c
 		return(0);				/* Assume correct time */
 	}
 
+		/* init ssl */
+	if ( is_ssl ) {
+		SSL_load_error_strings();
+		SSL_library_init();	
+
+		ctx = SSL_CTX_new(TLS_client_method());
+	    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, internalCertificateVerificationCallback);
+				
+		store = X509_STORE_new();
+		X509_STORE_set_default_paths(store);
+		SSL_CTX_set_cert_store(ctx, store);
+
+		ssl = SSL_new(ctx);
+
+		ssl_eno = SSL_set_fd(ssl, server_s);
+		if ( ssl_eno == 0 ) {
+			printlog( 1, "ssl set for %s failed", host );
+			closeSSL(ctx, ssl);
+			close(server_s);
+			return(0);
+		}
+		SSL_connect(ssl);
+	}
+
+
 	/* Initialize timer */
 	gettimeofday(&timeofday, NULL);
 
@@ -277,13 +380,13 @@ static long getHTTPdate( char *host, char *port, char *proxy, char *proxyport, c
 	nanosleep( &sleepspec, &remainder );
 
 	/* Send HEAD request */
-	if ( send(server_s, buffer, strlen(buffer), 0) < 0 )
+	if ( is_ssl ? writeSSL( ssl, buffer ) : send(server_s, buffer, strlen(buffer), 0) < 0 )
 		printlog( 1, "Error sending" );
 
 	/* Receive data from the web server
 	   The return code from recv() is the number of bytes received
 	*/
-	if ( recv(server_s, buffer, BUFFERSIZE - 1, 0) != -1 ) {
+	if ( (is_ssl ? readSSL( ssl, buffer ) : recv(server_s, buffer, BUFFERSIZE - 1, 0)) != -1 ) {
 
 		/* Assuming that network delay (server->htpdate) is neglectable,
 		   the received web server time "should" match the local time.
@@ -324,6 +427,10 @@ static long getHTTPdate( char *host, char *port, char *proxy, char *proxyport, c
 		}
 
 	}						/* bytes received */
+
+	if ( is_ssl ) {
+		closeSSL(ctx, ssl);
+	}
 
 	close( server_s );
 
@@ -413,7 +520,7 @@ static int htpdate_adjtimex( double drift ) {
 
 
 static void showhelp() {
-	puts("htpdate version "VERSION"\n\
+	puts("htpdate version "VERSION" with https support\n\
 Usage: htpdate [-046abdhlqstxD] [-i pid file] [-m minpoll] [-M maxpoll]\n\
          [-p precision] [-P <proxyserver>[:port]] [-u user[:group]]\n\
          <host[:port]> ...\n\n\
